@@ -183,6 +183,7 @@ cmake -S "$DEPS_DIR" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$REPO_ROOT/gcc.cmake" -DRISCV64=TRUE \
     -DKernelPlatform=qemu-riscv-virt -DKernelSel4Arch=riscv64 \
     -DKernelMaxNumNodes=4 -DKernelVerificationBuild=OFF \
+    -DKernelIsMCS=ON \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 log "Building kernel + libsel4 + elfloader + OpenSBI"
