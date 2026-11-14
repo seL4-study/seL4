@@ -204,6 +204,7 @@ import argparse
 import copy
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -244,6 +245,37 @@ def clone_entry_for_file(unity_entry, kernel_all_c, target_file):
     return entry
 
 
+def build_libsel4_header_entries(entries):
+    """Give every libsel4 header (incl. generated sel4_client.h, shared_types_gen.h)
+    its own entry. These headers are not self-contained (they rely on sel4/sel4.h
+    having been included first), so force-include it. Without these entries clangd
+    borrows flags from an unrelated *_pbf_temp.c entry and cannot resolve symbols."""
+    bases = [e for e in entries if Path(e["file"]).name == "sel4_bootinfo.c"]
+    if not bases:
+        return []
+    base = bases[0]
+    args = base.get("arguments") or shlex.split(base["command"])
+    flags, it = [], iter(args)
+    for a in it:
+        if a in ("-o", "-c"):
+            next(it, None)
+            continue
+        if a == base["file"]:
+            continue
+        flags.append(a)
+
+    include_dirs = [a[2:] for a in flags if a.startswith("-I") and "/libsel4/" in a]
+    headers = []
+    for d in include_dirs:
+        for h in sorted(Path(d).rglob("*.h")):
+            if str(h) not in headers:
+                headers.append(str(h))
+
+    return [{"directory": base["directory"], "file": h,
+             "arguments": flags + ["-x", "c-header", "-include", "sel4/sel4.h", "-c", h]}
+            for h in headers]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", help="CMake build directory containing compile_commands.json")
@@ -265,8 +297,13 @@ def main():
     kept = [e for e in entries if resolve(e["file"], e["directory"]) not in stale]
     expanded = [clone_entry_for_file(unity_entry, kernel_all_c, f) for f in source_files]
 
-    db_path.write_text(json.dumps(kept + [unity_entry] + expanded, indent=2))
+    headers = build_libsel4_header_entries(kept)
+    header_files = {e["file"] for e in headers}
+    kept = [e for e in kept if e["file"] not in header_files]
+
+    db_path.write_text(json.dumps(kept + [unity_entry] + expanded + headers, indent=2))
     print(f"expanded {len(source_files)} files from kernel_all.c into {db_path}")
+    print(f"added {len(headers)} libsel4 header entries")
 
 
 if __name__ == "__main__":
@@ -283,15 +320,34 @@ CompileFlags:
   Remove: [-Werror]
 EOF
 
+# clangd must be allowed to query the cross gcc that compile_commands.json uses,
+# otherwise it can't pick up the riscv64 target and gcc's builtin include paths.
+C_COMPILER="$(python3 - "$BUILD_DIR/compile_commands.json" <<'PYEOF'
+import json, shlex, sys
+for e in json.load(open(sys.argv[1])):
+    if e["file"].endswith("/kernel_all.c"):
+        print((e.get("arguments") or shlex.split(e["command"]))[0])
+        break
+PYEOF
+)"
+if [ -z "$C_COMPILER" ]; then
+    echo "error: could not find the kernel compiler in $BUILD_DIR/compile_commands.json" >&2
+    exit 1
+fi
+
 mkdir -p "$REPO_ROOT/.vscode"
 cat > "$REPO_ROOT/.vscode/settings.json" <<EOF
 {
-  "clangd.arguments": ["--compile-commands-dir=\${workspaceFolder}/$BUILD_DIR_NAME", "--background-index"],
+  "clangd.arguments": [
+    "--compile-commands-dir=\${workspaceFolder}/$BUILD_DIR_NAME",
+    "--background-index",
+    "--query-driver=$C_COMPILER"
+  ],
   "C_Cpp.intelliSenseEngine": "disabled"
 }
 EOF
 
-if ! grep -q "riscv-qemu build artifacts" "$REPO_ROOT/.gitignore" 2>/dev/null; then
+if ! grep -qxF "/$BUILD_DIR_NAME/" "$REPO_ROOT/.gitignore" 2>/dev/null; then
     {
         echo ""
         echo "# RISC-V QEMU build artifacts"
@@ -357,8 +413,7 @@ clangd is configured - open any kernel .c file in VSCode (restart the clangd
 language server if it was already running).
 
 To rebuild the kernel and refresh clangd's per-file compile commands:
-  cmake --build $BUILD_DIR_NAME
-  python3 tools/expand-compile-commands.py $BUILD_DIR_NAME
+  ./build.sh
 
 Boot the image again anytime with:
   qemu-system-riscv64 -M virt -m 3072 -nographic -smp 4 -bios $IMAGE

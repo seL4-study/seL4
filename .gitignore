@@ -33,3 +33,7 @@ manual/generated_markdown
 
 # Emacs backups
 *~
+
+# RISC-V QEMU build artifacts
+/.riscv-qemu/
+/build-riscv-qemu/
